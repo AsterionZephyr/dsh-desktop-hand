@@ -1,6 +1,6 @@
 # dsh-desktop-hand
 
-[![tests](https://github.com/ZephyrAssa/dsh-desktop-hand/actions/workflows/tests.yml/badge.svg)](https://github.com/ZephyrAssa/dsh-desktop-hand/actions/workflows/tests.yml)
+[![tests](https://github.com/AsterionZephyr/dsh-desktop-hand/actions/workflows/tests.yml/badge.svg)](https://github.com/AsterionZephyr/dsh-desktop-hand/actions/workflows/tests.yml)
 
 Windows desktop control for a DSH agent, as six agent-callable tools.
 
@@ -66,7 +66,7 @@ Windows desktop control for a DSH agent, as six agent-callable tools.
 ## 安装
 
 ```bash
-dsh plugin --profile web add github:ZephyrAssa/dsh-desktop-hand
+dsh plugin --profile web add github:AsterionZephyr/dsh-desktop-hand
 ```
 
 或手工安装——把仓库 clone 到任意位置，然后在 profile 的 `package.json`

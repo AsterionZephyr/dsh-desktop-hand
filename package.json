@@ -10,14 +10,14 @@
     "skills"
   ],
   "license": "MIT",
-  "author": "ZephyrAssa (AI-generated, see LICENSE)",
+  "author": "AsterionZephyr (AI-generated, see LICENSE)",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ZephyrAssa/dsh-desktop-hand.git"
+    "url": "git+https://github.com/AsterionZephyr/dsh-desktop-hand.git"
   },
-  "homepage": "https://github.com/ZephyrAssa/dsh-desktop-hand#readme",
+  "homepage": "https://github.com/AsterionZephyr/dsh-desktop-hand#readme",
   "bugs": {
-    "url": "https://github.com/ZephyrAssa/dsh-desktop-hand/issues"
+    "url": "https://github.com/AsterionZephyr/dsh-desktop-hand/issues"
   },
   "keywords": [
     "dsh-plugin",
