@@ -31,7 +31,8 @@
     本脚本输出 JSON，由 lib/index.js 消费。
 
 .PARAMETER Action
-    list-windows | capture | click | move | drag | type | key | focus | info
+    list-windows | capture | click | move | drag | type | key | focus | info |
+    ui-tree | scroll | clipboard | wait | open-app
 
 .PARAMETER Json
     仅作标记（本脚本恒以 JSON 输出），保留是为了调用处语义清晰。
@@ -66,6 +67,22 @@ param(
 
     # ---- focus ----
     [switch]$Restore,
+
+    # ---- v1.1：UI 语义层 / 滚动 / 剪贴板 / 等待 / 启动应用 ----
+    [string]$Target,              # click: UIA 控件名；wait: 窗口标题片段或控件名；open-app: 应用名片段
+    [string]$Until,               # wait: window（默认，等窗口出现）| gone（等消失）| text（等窗口里出现控件）
+    [string]$Role,                # UIA 角色过滤（子串匹配，如 button / edit / text / menuitem）
+    [int]$Depth = 3,              # ui-tree 最大深度（1 起）
+    [int]$MaxNodes = 200,         # ui-tree 最多节点数
+    [switch]$Flat,                # ui-tree 输出纯文本（给不带视觉的模型读）
+    [switch]$AllNodes,            # ui-tree 包含 offscreen 节点（-All 会与 list-windows 里的 $all 撞名）
+    [int]$Delta = 3,              # scroll 滚轮格数，正=下/右，负=上/左
+    [switch]$Horizontal,          # scroll 横向滚
+    [string]$Mode,                # clipboard: get | set
+    [switch]$KeepPrevious,        # clipboard set: 把原内容一起返回
+    [int]$WaitMs = 10000,         # wait / open-app 的超时（毫秒）
+    [int]$PollMs = 250,           # wait 轮询间隔（毫秒）
+    [switch]$NoWait,              # open-app: 启动后不等窗口出现
 
     [switch]$Json
 )
@@ -521,6 +538,25 @@ namespace DSKHand {
             keybd_event(mod, 0, KU, IntPtr.Zero);
         }
 
+        // ---- v1.1: 滚轮 ----
+        // 用 mouse_event 而不是 SendInput：SendInput 需要的 INPUT 结构本类已有，
+        // 但 mouse_event 的签名更短、语义就是"绝对定位一个滚轮事件"，读起来不易出错。
+        // dwData 是 DWORD，负的 delta 必须 unchecked 转成 uint，否则编译不过。
+        [DllImport("user32.dll")] public static extern void mouse_event(uint flags, int dx, int dy, uint data, IntPtr extra);
+        public const uint WHEEL = 0x0800, HWHEEL = 0x01000;
+
+        /// 在 (x,y) 处打一次滚轮。delta 正=向下/向右，一格 = 120。
+        ///
+        /// ⚠️ 垂直方向要**取反**：WM_MOUSEWHEEL 的正值是"向前滚"（内容上移），
+        /// 而这里的对外语义是"正=向下"，和本文档/规格保持一致；
+        /// 水平方向 HWHEEL 的正值本来就是"向右"，不用取反。
+        public static void ScrollWheel(int x, int y, int delta, bool horizontal) {
+            SetCursorPos(x, y);
+            System.Threading.Thread.Sleep(30);
+            int notches = horizontal ? delta : -delta;
+            mouse_event(horizontal ? HWHEEL : WHEEL, 0, 0, unchecked((uint)(notches * 120)), IntPtr.Zero);
+        }
+
         /// 输入法状态查询（诊断用）：能解释"输入被打进别处/被转换"。
         public static string ImeState() {
             try {
@@ -540,6 +576,279 @@ namespace DSKHand {
     }
 }
 '@ -ReferencedAssemblies System.Drawing, System.Windows.Forms
+}
+
+# =====================================================================
+#  v1.1 扩展层：UI Automation 语义树 + 剪贴板（惰性编译）
+# =====================================================================
+# 为什么单独一段、而且惰性编译：
+#   1) 隔离风险。这一段要引用 WPF 程序集（UIAutomationClient / UIAutomationTypes /
+#      WindowsBase）。万一某台机器解析不到它们，Add-Type 就会抛异常。若和上面的主类
+#      写在同一个 Add-Type 里，抓图/点击/输入会跟着一起不可用——不能拿小概率的
+#      环境问题去换掉已经验证过的核心能力。
+#   2) 省时间。引擎每个动作都是一次新的 powershell 进程，Add-Type 每次都重新编译。
+#      多编译两百行 C# 大约多花 0.5~1.5s，而 ui-tree/clipboard 之外的动作根本用不到它。
+# 所以：包成函数，只有真正用 UIA / 剪贴板的动作才调用。
+$script:ExtrasError = ''
+function Ensure-Extras {
+    if ('DSKHand.Extra' -as [type]) { return $true }
+    if ($script:ExtrasError -ne '') { return $false }   # 已经失败过，别重复编译
+    try {
+        # .NET Framework 里 UIAutomation* 与 WindowsBase 不在框架根目录，而在 WPF 子目录。
+        # 只写程序集短名时 csc 未必解析得到（System.Windows.Rect 就在 WindowsBase 里），
+        # 所以优先拼完整路径，拼不到再退回短名（GAC 里有的话短名也能解析）。
+        $refs = New-Object System.Collections.Generic.List[string]
+        $candidates = @(
+            (Join-Path $env:WINDIR 'Microsoft.NET/Framework64/v4.0.30319/WPF'),
+            (Join-Path $env:WINDIR 'Microsoft.NET/Framework/v4.0.30319/WPF')
+        )
+        $wpf = $null
+        foreach ($d in $candidates) {
+            if (Test-Path -LiteralPath (Join-Path $d 'UIAutomationClient.dll')) { $wpf = $d; break }
+        }
+        if ($null -ne $wpf) {
+            $refs.Add((Join-Path $wpf 'UIAutomationClient.dll'))
+            $refs.Add((Join-Path $wpf 'UIAutomationTypes.dll'))
+            $refs.Add((Join-Path $wpf 'WindowsBase.dll'))
+        } else {
+            $refs.Add('UIAutomationClient')
+            $refs.Add('UIAutomationTypes')
+            $refs.Add('WindowsBase')
+        }
+        $refs.Add('System.Windows.Forms')
+
+        Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Text;
+using System.Windows.Automation;
+using System.Windows;
+
+namespace DSKHand
+{
+    /// 一个 UIA 节点，只保留"做决策需要"的字段：
+    /// 角色、名称、值、屏幕矩形（可直接当点击坐标）、是否可动作。
+    public class UiNode
+    {
+        public int Depth;
+        public string Role = "";
+        public string Name = "";
+        public string AutomationId = "";
+        public string Value = "";
+        public int X, Y, W, H, CenterX, CenterY;
+        public bool Enabled = true;
+        public bool Offscreen;
+        public bool Invokable;
+    }
+
+    public static class Extra
+    {
+        // ---------------- 剪贴板 ----------------
+        public static string ClipGet()
+        {
+            try { return System.Windows.Forms.Clipboard.GetText(); }
+            catch { return null; }
+        }
+
+        public static bool ClipSet(string text)
+        {
+            if (text == null) text = "";
+            // SetText("") 会抛 ArgumentException（空串是非法的），要清空只能 Clipboard.Clear()。
+            if (text.Length == 0)
+            {
+                try { System.Windows.Forms.Clipboard.Clear(); return true; }
+                catch { return false; }
+            }
+            // 剪贴板可能被别的进程临时占用（OpenClipboard 失败），重试几次是标准做法。
+            for (int i = 0; i < 6; i++)
+            {
+                try { System.Windows.Forms.Clipboard.SetText(text); return true; }
+                catch { System.Threading.Thread.Sleep(70); }
+            }
+            return false;
+        }
+
+        // ---------------- UI Automation ----------------
+        static string Clip(string s, int max)
+        {
+            if (s == null) return "";
+            s = s.Replace(Environment.NewLine, " ").Trim();
+            return s.Length <= max ? s : s.Substring(0, max) + "...";
+        }
+
+        static string RoleOf(AutomationElement el)
+        {
+            try
+            {
+                ControlType t = el.Current.ControlType;
+                if (t == null) return "";
+                string p = t.ProgrammaticName;
+                if (p == null) return "";
+                if (p.StartsWith("ControlType.")) return p.Substring(12);
+                return p;
+            }
+            catch { return ""; }
+        }
+
+        static string NameOf(AutomationElement el)
+        {
+            try { string n = el.Current.Name; return n == null ? "" : n; }
+            catch { return ""; }
+        }
+
+        static string ReadValue(AutomationElement el)
+        {
+            object p = null;
+            try
+            {
+                if (el.TryGetCurrentPattern(ValuePattern.Pattern, out p))
+                    return Clip(((ValuePattern)p).Current.Value, 200);
+            }
+            catch { }
+            p = null;
+            try
+            {
+                if (el.TryGetCurrentPattern(TextPattern.Pattern, out p))
+                    return Clip(((TextPattern)p).DocumentRange.GetText(200), 200);
+            }
+            catch { }
+            return "";
+        }
+
+        static bool Actionable(AutomationElement el)
+        {
+            object p = null;
+            try { if (el.TryGetCurrentPattern(InvokePattern.Pattern, out p)) return true; } catch { }
+            p = null;
+            try { if (el.TryGetCurrentPattern(TogglePattern.Pattern, out p)) return true; } catch { }
+            p = null;
+            try { if (el.TryGetCurrentPattern(SelectionItemPattern.Pattern, out p)) return true; } catch { }
+            p = null;
+            try { if (el.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out p)) return true; } catch { }
+            p = null;
+            try { if (el.TryGetCurrentPattern(ScrollItemPattern.Pattern, out p)) return true; } catch { }
+            return false;
+        }
+
+        static UiNode Describe(AutomationElement el, int depth)
+        {
+            UiNode n = new UiNode();
+            n.Depth = depth;
+            n.Role = RoleOf(el);
+            n.Name = NameOf(el);
+            try { string a = el.Current.AutomationId; n.AutomationId = a == null ? "" : a; } catch { }
+            try { n.Enabled = el.Current.IsEnabled; } catch { }
+            try { n.Offscreen = el.Current.IsOffscreen; } catch { }
+            try
+            {
+                Rect r = el.Current.BoundingRectangle;
+                if (!r.IsEmpty)
+                {
+                    n.X = (int)Math.Round(r.X);
+                    n.Y = (int)Math.Round(r.Y);
+                    n.W = (int)Math.Round(r.Width);
+                    n.H = (int)Math.Round(r.Height);
+                    n.CenterX = n.X + n.W / 2;
+                    n.CenterY = n.Y + n.H / 2;
+                }
+            }
+            catch { }
+            n.Value = ReadValue(el);
+            n.Invokable = Actionable(el);
+            return n;
+        }
+
+        static void Walk(TreeWalker w, AutomationElement parent, int parentDepth, int maxDepth,
+                         int maxNodes, bool includeOffscreen, string roleFilter, List<UiNode> list)
+        {
+            if (parentDepth >= maxDepth || list.Count >= maxNodes) return;
+            AutomationElement child = null;
+            try { child = w.GetFirstChild(parent); } catch { return; }
+            string rf = roleFilter == null ? "" : roleFilter.ToLowerInvariant();
+            while (child != null && list.Count < maxNodes)
+            {
+                UiNode n = Describe(child, parentDepth + 1);
+                bool keep = includeOffscreen || !n.Offscreen;
+                if (keep && rf.Length > 0 && n.Role.ToLowerInvariant().IndexOf(rf) < 0) keep = false;
+                if (keep) list.Add(n);
+                if (parentDepth + 1 < maxDepth)
+                    Walk(w, child, parentDepth + 1, maxDepth, maxNodes, includeOffscreen, roleFilter, list);
+                AutomationElement next = null;
+                try { next = w.GetNextSibling(child); } catch { break; }
+                child = next;
+            }
+        }
+
+        /// 把窗口读成 UIA 节点列表。用 ControlView 走查：跳过纯排版容器，留下可操作/可读的元素。
+        /// 实测过的无效兜底（2026-10-22）：结果太薄时改走 RawViewWalker 并不会多出内容（设置仍 3 个
+        /// 节点、计算器仍是 ControlView 那 17 个），说明薄不是"视图剪枝"，而是该应用没提供 UIA 内容树。
+        public static List<UiNode> Dump(long hwnd, int maxDepth, int maxNodes, bool includeOffscreen, string roleFilter)
+        {
+            List<UiNode> list = new List<UiNode>();
+            if (maxDepth < 1) maxDepth = 1;
+            if (maxDepth > 32) maxDepth = 32;
+            if (maxNodes < 1) maxNodes = 1;
+            AutomationElement root = null;
+            try { root = AutomationElement.FromHandle(new IntPtr(hwnd)); } catch { return list; }
+            if (root == null) return list;
+            TreeWalker w = TreeWalker.ControlViewWalker;
+            Walk(w, root, 0, maxDepth, maxNodes, includeOffscreen, roleFilter, list);
+            return list;
+        }
+
+        /// 按名称片段找控件。深度放宽（真实应用层级很深），用节点数上限控成本。
+        public static List<UiNode> Find(long hwnd, string name, string roleFilter, int maxNodes)
+        {
+            List<UiNode> hit = new List<UiNode>();
+            string needle = name == null ? "" : name.ToLowerInvariant().Trim();
+            if (needle.Length == 0) return hit;
+            List<UiNode> all = Dump(hwnd, 24, 3000, true, roleFilter);
+            foreach (UiNode n in all)
+            {
+                if (n.Name.Length == 0) continue;
+                if (n.Name.ToLowerInvariant().IndexOf(needle) < 0) continue;
+                hit.Add(n);
+                if (hit.Count >= maxNodes) break;
+            }
+            return hit;
+        }
+    }
+}
+'@ -ReferencedAssemblies $refs.ToArray()
+        return $true
+    } catch {
+        $script:ExtrasError = $_.Exception.Message
+        return $false
+    }
+}
+
+# =====================================================================
+#  目标窗口解析（v1.1 新增的四个动作共用）
+# =====================================================================
+# 为什么抽成函数：ui-tree / click(target) / scroll / wait 都要回答"目标是谁"，
+# 而 -Window 模糊匹配到多个时必须报 AMBIGUOUS、不能擅自选第一个（实测过：
+# 同一标题会有 ApplicationFrameWindow 壳 + 真实进程两个句柄，选错就抓空白）。
+# 四份重复实现必然漂移成三份规矩，所以只留这一份。
+function Resolve-Window([string]$Narrow, [Int64]$HandleArg, [bool]$AllowForeground) {
+    if ($HandleArg -ne 0) {
+        $w = [DSKHand.Api]::ByHandle($HandleArg)
+        if ($null -eq $w) { Fail "窗口句柄 $HandleArg 无效或已关闭。" 'NO_SUCH_WINDOW' }
+        return $w
+    }
+    if ($Narrow) {
+        $hits = @([DSKHand.Api]::MatchWindows($Narrow))
+        if ($hits.Count -eq 0) { Fail "没有标题包含'$Narrow'的可见窗口。用 list-windows 看当前有哪些窗口。" 'NO_MATCH' }
+        if ($hits.Count -gt 1) {
+            $cand = ($hits | ForEach-Object { "handle=$($_.Handle) title='$($_.Title)' process=$($_.Process)" }) -join ' | '
+            Fail "标题'$Narrow'匹配到 $($hits.Count) 个窗口，请用 handle 精确指定：$cand" 'AMBIGUOUS'
+        }
+        return $hits[0]
+    }
+    if (-not $AllowForeground) { Fail '需要 -Window 或 -Handle 之一。' 'MISSING_TARGET' }
+    $fg = [DSKHand.Api]::GetForegroundWindow()
+    $w2 = [DSKHand.Api]::ByHandle([long]$fg)
+    if ($null -eq $w2) { Fail '当前没有可用的前台窗口，请用 -Window 或 -Handle 指定。' 'MISSING_TARGET' }
+    return $w2
 }
 
 # =====================================================================
@@ -592,6 +901,7 @@ try {
                 ime = [DSKHand.Api]::ImeState()
                 remoteTools = $remote
                 displays = $displays
+                foregroundHandle = [long]([DSKHand.Api]::GetForegroundWindow())
                 psVersion = $PSVersionTable.PSVersion.ToString()
             }
         }
@@ -731,6 +1041,48 @@ try {
 
         # ---------------------------------------------------------------
         'click' {
+            # ---- v1.1：按 UIA 控件名点击（不必先截图量坐标）----
+            # 为什么这条很重要：ApplicationFrameWindow 宿主壳用 PrintWindow 抓出来是空白，
+            # 但它的 UIA 树里有真实控件和边界矩形。所以"看不见"不等于"点不到"。
+            if ($Target) {
+                if (-not (Ensure-Extras)) {
+                    Fail "UI Automation 扩展不可用（$($script:ExtrasError)）。改用坐标点击：先 desktop_capture 看图量坐标。" 'UIA_UNAVAILABLE'
+                }
+                $tw = Resolve-Window $Window $Handle $true
+                $hits = @([DSKHand.Extra]::Find([long]$tw.Handle, $Target, $Role, 40))
+                if ($hits.Count -eq 0) {
+                    $sample = @([DSKHand.Extra]::Dump([long]$tw.Handle, 6, 400, $true, '') |
+                        Where-Object { $_.Invokable -and $_.Name -ne '' } |
+                        Select-Object -First 10 |
+                        ForEach-Object { "$($_.Role) '$($_.Name)'" })
+                    $tip = if ($sample.Count -gt 0) {
+                        "该窗口可点的控件（前 10 个）：$($sample -join ' | ')"
+                    } else {
+                        '这个窗口的 UIA 树里没有可点控件，可能是自绘界面，只能用坐标点击。'
+                    }
+                    Fail "窗口'$($tw.Title)'里没有名称包含'$Target'的控件。$tip" 'NO_MATCH'
+                }
+                # 精确同名优先：'确定' 和 '确定并关闭' 都含搜索词时，别擅自点第一个长名字。
+                $exact = @($hits | Where-Object { $_.Name -eq $Target })
+                if ($exact.Count -ge 1) {
+                    $pick = $exact[0]
+                } elseif ($hits.Count -eq 1) {
+                    $pick = $hits[0]
+                } else {
+                    $cand = ($hits | ForEach-Object { "$($_.Role) '$($_.Name)' @$($_.CenterX),$($_.CenterY)" }) -join ' | '
+                    Fail "名称包含'$Target'的控件有 $($hits.Count) 个，请写更完整的名称或用 -Role 限定：$cand" 'AMBIGUOUS'
+                }
+                if ($pick.W -le 0 -or $pick.H -le 0) {
+                    Fail "控件'$($pick.Name)'没有可见边界（offscreen 或还没渲染），改用坐标点击。" 'NO_HIT_RECT'
+                }
+                [DSKHand.Api]::Click($pick.CenterX, $pick.CenterY, [bool]$Right, [bool]$Double, $SettleMs)
+                Emit @{ ok = $true; action = 'click-target'
+                        targetName = $pick.Name; targetRole = $pick.Role
+                        shot = "$($pick.CenterX),$($pick.CenterY)"
+                        phys = "$($pick.CenterX),$($pick.CenterY)"; scale = 1
+                        window = $tw.Title; cursor = [DSKHand.Api]::Cur() }
+                break
+            }
             $sw = if ($ShotWidth -le 0) { $physW } else { $ShotWidth }
             $scale = [double]$physW / [double]$sw
             $px = [int][math]::Round($X * $scale)
@@ -844,7 +1196,274 @@ try {
                    } else { '' }) }
         }
 
-        default { Fail "未知动作 `"$Action`"。可用：info list-windows capture click move drag probe type key focus" 'BAD_ACTION' }
+        # ---------------------------------------------------------------
+        #  v1.1：把窗口读成 UIA 语义树
+        # ---------------------------------------------------------------
+        # 这是 ApplicationFrameWindow 空白壳盲区的正解：那类窗口用 PrintWindow 只能
+        # 抓到空壳，但 UIA 树里是真实的控件、名称、值和边界矩形。
+        'ui-tree' {
+            if (-not (Ensure-Extras)) {
+                Fail "UI Automation 扩展不可用（$($script:ExtrasError)）。抓图与坐标点击仍然可用。" 'UIA_UNAVAILABLE'
+            }
+            $w = Resolve-Window $Window $Handle $true
+            $nodes = @([DSKHand.Extra]::Dump([long]$w.Handle, $Depth, $MaxNodes, [bool]$AllNodes, $Role))
+            $arr = @()
+            foreach ($n in $nodes) {
+                $arr += @{
+                    depth = $n.Depth; role = $n.Role; name = $n.Name; automationId = $n.AutomationId
+                    value = $n.Value
+                    x = $n.X; y = $n.Y; width = $n.W; height = $n.H
+                    centerX = $n.CenterX; centerY = $n.CenterY
+                    enabled = $n.Enabled; offscreen = $n.Offscreen; invokable = $n.Invokable
+                }
+            }
+            $out = @{
+                ok = $true; target = $w.Title; targetClass = $w.Class
+                count = $arr.Count; truncated = ($arr.Count -ge $MaxNodes); flat = [bool]$Flat
+                isFrameHost = $w.IsFrameHost; minimized = $w.Minimized
+                nodes = $arr
+            }
+            if ($Flat) {
+                # 纯文本视图：给没有视觉能力的模型读界面内容，也方便人 grep。
+                $sb = New-Object System.Text.StringBuilder
+                foreach ($n in $nodes) {
+                    if ($n.Name -eq '' -and $n.Value -eq '') { continue }
+                    $line = ('  ' * $n.Depth) + $n.Role
+                    if ($n.Name -ne '') { $line += ' "' + $n.Name + '"' }
+                    if ($n.Value -ne '') { $line += ' = ' + $n.Value }
+                    if ($n.Invokable) { $line += ' @' + $n.CenterX + ',' + $n.CenterY }
+                    [void]$sb.AppendLine($line)
+                }
+                $flatText = $sb.ToString().TrimEnd()
+                if ($flatText.Length -gt 8000) { $flatText = $flatText.Substring(0, 8000) + '...(已截断)' }
+                $out.text = $flatText
+            }
+            Emit $out
+        }
+
+        # ---------------------------------------------------------------
+        #  v1.1：滚轮
+        # ---------------------------------------------------------------
+        'scroll' {
+            # 坐标口径与 click 一致：默认物理像素；给了 ShotWidth 就按截图宽度换算。
+            $w = $null
+            if ($Handle -ne 0 -or $Window) { $w = Resolve-Window $Window $Handle $false }
+            $atX = $X; $atY = $Y
+            if ($atX -eq 0 -and $atY -eq 0) {
+                if ($null -ne $w) {
+                    $atX = $w.X + [int]($w.W / 2); $atY = $w.Y + [int]($w.H / 2)
+                } else {
+                    # 没给点也没给窗口：就地滚（别把光标挪到 0,0 去）
+                    $parts = ([DSKHand.Api]::Cur()) -split ','
+                    if ($parts.Count -eq 2) { $atX = [int]$parts[0]; $atY = [int]$parts[1] }
+                }
+            }
+            if ($ShotWidth -gt 0) {
+                $scale2 = [double]$physW / [double]$ShotWidth
+                $atX = [int][math]::Round($atX * $scale2)
+                $atY = [int][math]::Round($atY * $scale2)
+            }
+            [DSKHand.Api]::ScrollWheel($atX, $atY, $Delta, [bool]$Horizontal)
+            Emit @{ ok = $true; action = 'scroll'; atX = $atX; atY = $atY
+                    delta = $Delta; horizontal = [bool]$Horizontal
+                    cursor = [DSKHand.Api]::Cur(); foreground = [DSKHand.Api]::ForegroundTitle() }
+        }
+
+        # ---------------------------------------------------------------
+        #  v1.1：剪贴板读写
+        # ---------------------------------------------------------------
+        'clipboard' {
+            if (-not (Ensure-Extras)) {
+                Fail "剪贴板扩展不可用（$($script:ExtrasError)）。" 'UIA_UNAVAILABLE'
+            }
+            $m = if ($Mode) { $Mode.ToLower().Trim() } else { 'get' }
+            if ($m -eq 'get') {
+                $t = [DSKHand.Extra]::ClipGet()
+                if ($null -eq $t) { Fail '读剪贴板失败（可能被别的进程占用），稍后重试。' 'CLIPBOARD_FAILED' }
+                Emit @{ ok = $true; mode = 'get'; text = $t; chars = $t.Length }
+            } elseif ($m -eq 'set') {
+                if (-not $PSBoundParameters.ContainsKey('Text')) { Fail 'clipboard set 需要 -Text。' 'MISSING_TEXT' }
+                $old = $null
+                if ($KeepPrevious) { $old = [DSKHand.Extra]::ClipGet() }
+                $val = [string]$Text
+                if (-not [DSKHand.Extra]::ClipSet($val)) {
+                    Fail '写剪贴板失败（可能被别的进程占用），稍后重试。' 'CLIPBOARD_FAILED'
+                }
+                $o = @{ ok = $true; mode = 'set'; chars = $val.Length }
+                # 只有显式要了才把原内容带回来，避免把用户剪贴板内容无谓地塞进上下文
+                if ($KeepPrevious) { $o.previous = $(if ($null -eq $old) { '' } else { $old }) }
+                Emit $o
+            } else {
+                Fail "未知 -Mode '$Mode'，可用 get 或 set。" 'BAD_MODE'
+            }
+        }
+
+        # ---------------------------------------------------------------
+        #  v1.1：等窗口 / 等控件（替代固定 Start-Sleep，消除竞态）
+        # ---------------------------------------------------------------
+        'wait' {
+            $u = if ($Until) { $Until.ToLower().Trim() } else { 'window' }
+            if ($u -ne 'window' -and $u -ne 'gone' -and $u -ne 'text') {
+                Fail "未知的 -Until '$Until'，可用 window / gone / text。" 'BAD_UNTIL'
+            }
+            if (-not $Target) { Fail 'wait 需要 -Target（窗口标题片段；-Until text 时是控件名）。' 'MISSING_TARGET' }
+            $poll = if ($PollMs -lt 50) { 50 } else { $PollMs }
+            $limit = if ($WaitMs -lt 100) { 100 } else { $WaitMs }
+            $t0 = Get-Date
+            $waitHits = @()
+            $detail = ''
+            $satisfied = $false
+            while (-not $satisfied) {
+                $elapsed = [int]((Get-Date) - $t0).TotalMilliseconds
+                if ($u -eq 'text') {
+                    if (-not (Ensure-Extras)) {
+                        Fail "UI Automation 扩展不可用（$($script:ExtrasError)）。" 'UIA_UNAVAILABLE'
+                    }
+                    $tw = Resolve-Window $Window $Handle $true
+                    $found = @([DSKHand.Extra]::Find([long]$tw.Handle, $Target, $Role, 10))
+                    if ($found.Count -gt 0) {
+                        $satisfied = $true
+                        $waitHits = @($found | ForEach-Object { $_.Name })
+                        $detail = "窗口'$($tw.Title)'里出现了 $($found.Count) 个匹配控件"
+                    }
+                } else {
+                    $hits = @([DSKHand.Api]::MatchWindows($Target))
+                    if ($u -eq 'window' -and $hits.Count -gt 0) {
+                        $satisfied = $true
+                        $waitHits = @($hits | Select-Object -First 5 | ForEach-Object { $_.Title })
+                        $detail = "出现 $($hits.Count) 个匹配窗口，首个 handle=$($hits[0].Handle)"
+                    } elseif ($u -eq 'gone' -and $hits.Count -eq 0) {
+                        $satisfied = $true
+                        $detail = '目标窗口已消失'
+                    }
+                }
+                if ($satisfied) { break }
+                if ($elapsed -ge $limit) {
+                    Fail "等待 $limit ms 后仍未满足 -Until $u -Target '$Target'。" 'TIMEOUT'
+                }
+                Start-Sleep -Milliseconds $poll
+            }
+            Emit @{ ok = $true; satisfied = $true; until = $u; target = $Target
+                    elapsedMs = [int]((Get-Date) - $t0).TotalMilliseconds
+                    detail = $detail; matches = $waitHits }
+        }
+
+        # ---------------------------------------------------------------
+        #  v1.1：启动应用（搜开始菜单/桌面快捷方式，不碰焦点也不打字）
+        # ---------------------------------------------------------------
+        'open-app' {
+            if (-not $Target) { Fail 'open-app 需要 -Target（应用名片段，如 "记事本" 或 "Notepad"）。' 'MISSING_TARGET' }
+            $needle2 = $Target.ToLower()
+            $roots = @()
+            $roots += (Join-Path $env:APPDATA 'Microsoft/Windows/Start Menu/Programs')
+            $roots += (Join-Path $env:ProgramData 'Microsoft/Windows/Start Menu/Programs')
+            $roots += (Join-Path $env:USERPROFILE 'Desktop')
+            try {
+                $pub = [Environment]::GetFolderPath('CommonDesktopDirectory')
+                if ($pub) { $roots += $pub }
+            } catch { }
+            $cands = @()
+            foreach ($root in $roots) {
+                if (-not (Test-Path -LiteralPath $root)) { continue }
+                $links = @(Get-ChildItem -LiteralPath $root -Filter '*.lnk' -Recurse -File -ErrorAction SilentlyContinue)
+                foreach ($l in $links) {
+                    $base = [System.IO.Path]::GetFileNameWithoutExtension($l.Name)
+                    if ($base.ToLower().Contains($needle2)) { $cands += $l.FullName }
+                }
+                if ($cands.Count -gt 0) { break }
+            }
+            if ($cands.Count -eq 0) {
+                # 兜底：少数应用只放了 .exe 没有 .lnk（绿色版拷进开始菜单目录的）。
+                foreach ($root in $roots) {
+                    if (-not (Test-Path -LiteralPath $root)) { continue }
+                    $exes = @(Get-ChildItem -LiteralPath $root -Filter '*.exe' -Recurse -File -ErrorAction SilentlyContinue)
+                    foreach ($exeItem in $exes) {
+                        # ⚠️ 循环变量别用单字母：$X/$Y/$Text/$Key/$Mode 等都是 param() 里
+                        # 声明过的变量（变量名大小写不敏感），赋值会被参数类型检查拦下。
+                        $base = [System.IO.Path]::GetFileNameWithoutExtension($exeItem.Name)
+                        if ($base.ToLower().Contains($needle2)) { $cands += $exeItem.FullName }
+                    }
+                    if ($cands.Count -gt 0) { break }
+                }
+            }
+            $appIdTarget = $null
+            $appNameTarget = $null
+            if ($cands.Count -eq 0) {
+                # 兜底 2：UWP/MSIX 应用根本没有 .lnk（记事本、计算器、照片… 在 Win11 全是 MSIX），
+                # 只能查 Get-StartApps 拿 AppID，再用 shell:AppsFolder 交给 shell 调起。
+                try {
+                    $appHits = @(Get-StartApps | Where-Object { $_.Name -and $_.Name.ToLower().Contains($needle2) })
+                    if ($appHits.Count -gt 0) {
+                        $best = @($appHits | Sort-Object -Property @{ Expression = { $_.Name.Length } })[0]
+                        $appIdTarget = $best.AppID
+                        $appNameTarget = $best.Name
+                    }
+                } catch { }
+            }
+            if ($cands.Count -eq 0 -and -not $appIdTarget) {
+                Fail "开始菜单/桌面里找不到名称含'$Target'的快捷方式，Get-StartApps 里也没有同名应用。如果它已经在运行，直接用 list-windows 找窗口即可。" 'NOT_LAUNCHED'
+            }
+            $t0 = Get-Date
+            $launchedPid = 0
+            # 启动前的窗口句柄集合：MSIX 应用的窗口标题可能和 Target 完全对不上
+            # （实测 Win11 记事本标题是 "无标题 - Notepad"，而 Target 是「记事本」），
+            # 所以除了 pid/标题/进程名匹配，还得兜底「启动后冒出来的新窗口」。
+            $beforeH = @([DSKHand.Api]::ListWindows() | ForEach-Object { $_.Handle })
+            try {
+                $launchPath = $null
+                if ($appIdTarget) {
+                    # MSIX 应用不能用 Start-Process 直接调（CreateProcess 不认 shell: 协议），
+                    # 交给 explorer 解析，代价是拿不到 pid —— 后面按标题/进程名兜底找窗口。
+                    # ⚠️ 必须用反斜杠：写成 shell:AppsFolder/xxx 时 explorer 会把参数当普通
+                    # 路径，实测打开的是「文档」而不是应用（2026-10-22 自检踩到）。
+                    $launchPath = 'shell:AppsFolder\' + $appIdTarget
+                    $null = Start-Process -FilePath 'explorer.exe' -ArgumentList ('shell:AppsFolder\' + $appIdTarget) -ErrorAction Stop
+                } else {
+                    $launchPath = $cands[0]
+                    $proc = Start-Process -FilePath $launchPath -PassThru -ErrorAction Stop
+                    if ($null -ne $proc) { $launchedPid = $proc.Id }
+                }
+            } catch {
+                Fail "启动'$launchPath'失败：$($_.Exception.Message)" 'NOT_LAUNCHED'
+            }
+            $titles = @()
+            $matchedBy = ''
+            if (-not $NoWait) {
+                $limit2 = if ($WaitMs -lt 500) { 500 } else { $WaitMs }
+                while (((Get-Date) - $t0).TotalMilliseconds -lt $limit2) {
+                    # .lnk 常常先起一个转发进程，真正的窗口属于子进程 —— 所以 pid 之外
+                    # 还要按标题/进程名兜底匹配，否则会误报"启动了但没窗口"。
+                    $allW = @([DSKHand.Api]::ListWindows())
+                    $mine = @($allW | Where-Object {
+                        ($launchedPid -gt 0 -and $_.Pid -eq $launchedPid) -or
+                        ($_.Title -and $_.Title.ToLower().Contains($needle2)) -or
+                        ($_.Process -and $_.Process.ToLower().Contains($needle2)) -or
+                        ($appNameTarget -and $_.Title -and $_.Title.ToLower().Contains($appNameTarget.ToLower())) })
+                    if ($mine.Count -gt 0) {
+                        $titles = @($mine | ForEach-Object { $_.Title })
+                        $matchedBy = 'pattern'
+                        break
+                    }
+                    # 兜底：启动后新冒出来的够大的窗口。先给 pattern 匹配 800ms 机会，别抢跑。
+                    if (((Get-Date) - $t0).TotalMilliseconds -gt 800) {
+                        $fresh = @($allW | Where-Object { $_.W -gt 60 -and $_.H -gt 60 -and ($beforeH -notcontains $_.Handle) })
+                        if ($fresh.Count -gt 0) {
+                            $titles = @($fresh | ForEach-Object { $_.Title })
+                            $matchedBy = 'new-window'
+                            break
+                        }
+                    }
+                    Start-Sleep -Milliseconds 250
+                }
+            }
+            Emit @{ ok = $true; launched = $true; path = $launchPath; appId = $appIdTarget
+                    appName = $appNameTarget; pid = $launchedPid
+                    titles = $titles; matchedBy = $matchedBy
+                    waitedMs = [int]((Get-Date) - $t0).TotalMilliseconds
+                    candidates = @($cands | Select-Object -First 10) }
+        }
+
+        default { Fail "未知动作 `"$Action`"。可用：info list-windows capture click move drag probe type key focus ui-tree scroll clipboard wait open-app" 'BAD_ACTION' }
     }
 }
 catch {

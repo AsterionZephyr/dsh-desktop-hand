@@ -2,10 +2,14 @@
 
 [![tests](https://github.com/AsterionZephyr/dsh-desktop-hand/actions/workflows/tests.yml/badge.svg)](https://github.com/AsterionZephyr/dsh-desktop-hand/actions/workflows/tests.yml)
 
-Windows desktop control for a DSH agent, as six agent-callable tools.
+Windows desktop control for a DSH agent, as eleven agent-callable tools.
 
 > A plugin for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness).
 > **Windows only.**
+>
+> 当前版本 **1.1.0**（2026-10-22）：在 v1.0 的抓图 / 点击 / 输入 / 聚焦四件原语之上，
+> 加了 UIA 语义层、滚动、剪贴板、等待、启动应用。接口已冻结，规格见
+> [`docs/DESIGN-v1.1-ui-layer.zh-CN.md`](docs/DESIGN-v1.1-ui-layer.zh-CN.md)。
 
 ---
 
@@ -40,22 +44,49 @@ Windows desktop control for a DSH agent, as six agent-callable tools.
 **点击会回报落点。** `desktop_click` 校验光标最终位置并与目标比对，
 落点不对会明确告诉你，而不是静默失败。
 
-**六个工具：**
+**读界面不靠像素（v1.1）。** `desktop_ui_tree` 读窗口的 UI Automation 树，逐个控件给出
+`role / name / automationId / value / 屏幕边界`，可输出结构化 `nodes[]` 或纯文本 `flat`。
+理论上连`ApplicationFrameWindow` 空白壳也能读（壳的像素拷不出来，控件树还在），**但前提是该应用真的暴露了 UIA 内容树** —— 这条限制很硬，见下方已知边界第一条。
+`desktop_click` 可直接给 `target`（控件名）+ 可选 `role`，不必先量坐标。
+
+**等条件，不等固定时长（v1.1）。** `desktop_wait` 等窗口出现/消失，或等某个窗口的
+UIA 树里出现指定控件，替代 `Start-Sleep`。超时会带上已等待毫秒与最后一次观察到的状态。
+
+**长文本走剪贴板（v1.1）。** `desktop_clipboard` 读写剪贴板；`keepPrevious` 会让 set
+结果带上原内容 `previous`。路径、多行文本用 `set` + `desktop_type(key="ctrl+v")` 搬运。
+
+**十一个工具（v1.1.0）：**
 
 | 工具 | 用途 |
 | --- | --- |
 | `desktop_diagnose` | 体检：此刻合成输入可不可信（DPI / 屏幕 / 前台窗口 / 输入法 / 远程软件 / 光标落点稳定性） |
-| `desktop_list_windows` | 列窗口：句柄、PID、进程、标题、位置尺寸、是否 UWP、是否最小化 |
+| `desktop_list_windows` | 列窗口：句柄、PID、进程、标题、位置尺寸、是否 UWP / 宿主壳、是否最小化 |
 | `desktop_capture` | 截屏：全屏 / 指定窗口（标题或句柄）/ 区域裁切，**图片直接返回** |
+| `desktop_ui_tree` | 读窗口的 UIA 树：逐个控件给 `role/name/value/边界`；结构化或纯文本（`flat`）；只对暴露 UIA 的应用有效 |
 | `desktop_focus` | 把窗口拉到前台，并**报告是否真的成功** |
-| `desktop_click` | 点击 / 双击 / 右键 / 拖动，带落点校验 |
+| `desktop_click` | 按坐标点击 / 双击 / 右键 / 拖动，带落点校验；**或按控件名点**（`target` + 可选 `role`） |
+| `desktop_scroll` | 滚轮：`delta`（默认 3，正=下/右），`horizontal: true` 横向 |
 | `desktop_type` | 输入文本（Unicode 直投）或发送白名单按键 |
+| `desktop_clipboard` | 剪贴板 `get` / `set`；`keepPrevious` 时 set 结果带原内容 `previous` |
+| `desktop_wait` | 等窗口出现/消失（`until: window/gone`）或等控件出现（`until: text`），替代固定 sleep |
+| `desktop_open_app` | 搜开始菜单/桌面快捷方式启动应用（`app`）；**Store/MSIX 应用**（记事本、计算器）走 `Get-StartApps` 拿 AppID 调起；返回 pid 与窗口标题 |
 
 **已知边界（不是 bug）：**
 
-- **UWP 应用抓不到内容**（设置、计算器等）。`PrintWindow` 对走 DirectComposition
-  渲染的 UWP 是硬盲区，PowerShell 侧无法绕过。工具会返回 `uwpWarning`——
-  此时**不要根据那张图判断界面状态**。
+- **Store/MSIX 应用启动后拿不到 pid，标题也可能对不上。** Win11 的记事本/计算器没有
+  `.lnk`，`desktop_open_app` 改查 `Get-StartApps` 的 AppID，交给 `shell:AppsFolder\<AppID>`
+  让 shell 调起（`Start-Process` 直接调会报"找不到文件"）。副作用：`pid` 恒为 0，
+  而且**窗口标题是本地化不一致的**（中文系统上记事本窗口叫 `无标题 - Notepad`），
+  所以引擎用"启动前后窗口句柄差集"认领新窗口，返回 `matchedBy: "new-window"`。
+  看不到 `titles` 不代表没启动成功，先用 `desktop_list_windows` 复核。
+- **UWP 不是"一定抓不到"，取决于具体应用**（2026-10-22 实测两个样本）：
+  - 「计算器」：**宿主壳句柄就能抓到完整内容**（`uwpWarning` 却是 true —— 底色占比 963‰，
+    因为面板本身大面积同一底色）；`ui_tree` 读到 34 个按钮，`click(target="关闭 计算器")` 一次成功。
+  - 「设置」：宿主壳抓到纯背景（986‰ / 18 色），必须改用 `frameHost=false` 的
+    `Windows.UI.Core.CoreWindow` 句柄才拿到真内容；而它的 `ui_tree` **两个句柄都读不到**
+    （frame 3 个节点 / CoreWindow 0 个）—— 这种应用只能按坐标点。
+  顺序：抓壳空白 → 换另一个句柄重抓；要操作 → 先试 `ui_tree`，读不到再退回坐标。
+  `uwpWarning` 只是"底色占比高"的提示，**不是判据**，一律以图为准。
 - **最小化的窗口**尺寸退化，抓到的内容无意义（返回 `minimized: true`）。
 - **远程会话正在操作鼠标时，合成点击不可靠**：坐标会被实时覆盖，调参无用。
   用 `desktop_diagnose` 确认，等远端空闲即可。**不要杀远程控制进程**，那会断连。
@@ -114,7 +145,9 @@ dsh plugin --profile web add github:AsterionZephyr/dsh-desktop-hand
 
 ## 使用
 
-agent 装上后会自动获得这六个工具。典型流程：
+agent 装上后会自动获得这十一个工具。两条主路径，外加长文本走剪贴板：
+
+**A. 有画面：看图量坐标。**
 
 ```
 desktop_list_windows            → 找到目标，拿句柄
@@ -124,7 +157,26 @@ desktop_type(text="...")        → 输入
 desktop_capture(handle=...)     → 再看图确认结果
 ```
 
-### 四条使用要点
+**B. 空白壳 / 不想量坐标：读 UIA 树，按控件名点。**
+
+```
+desktop_list_windows                     → 找到目标，拿句柄
+desktop_capture(handle=...)              → 空白壳？不要据此判断界面状态
+desktop_ui_tree(handle=..., flat=true)   → 读控件树；要结构/边界就用 nodes[]
+desktop_click(handle=..., target="保存")  → 按控件名点，可加 role="button"
+desktop_wait(until="text", target="已保存", handle=...)  → 等结果，不要 sleep
+desktop_capture(handle=...)              → 只有需要视觉确认时才再抓图
+```
+
+**C. 长文本 / 路径 / 多行：走剪贴板。**
+
+```
+desktop_clipboard(mode="set", text="C:\path with spaces\file.txt", keepPrevious=true)
+desktop_type(key="ctrl+v")                    → 目标窗口必须在前台
+desktop_clipboard(mode="set", text="<上一步返回的 previous>")   → 需要还原就写回
+```
+
+### 六条使用要点
 
 **1. 要看窗口内容就用 `window`/`handle`，不要抓全屏**——除非你确实要看屏幕上真实
 可见的东西。指定窗口走 `PrintWindow`，被遮挡也能抓到目标自己的内容。
@@ -132,12 +184,19 @@ desktop_capture(handle=...)     → 再看图确认结果
 **2. 看图和点图用同一张图。** `desktop_capture` 结果的 `width` 若与物理屏宽不一致，
 把该 `width` 作为 `shotWidth` 传给 `desktop_click`。一致时图中像素坐标 1:1 可用。
 
-**3. 不要用黑像素比例判断抓取成功，必须看图。** UWP 应用是盲区，工具会给
-`uwpWarning`。
-
+**3. 不要用黑像素比例判断抓取成功，必须看图。** 底色占比高时工具会给 `uwpWarning` ——
+那可能真是空白壳，也可能只是界面大面积同色（计算器就误报过）。要操作就先试 `desktop_ui_tree`，
+它读不到才说明该应用没暴露 UIA。
 **4. 点不准或输入丢失时，先跑 `desktop_diagnose`，不要调坐标。** 它会连采两次
 光标落点：稳定=可用；持续漂移=有别的输入源在覆盖（通常是远程会话）。这是环境
 问题，改代码没用。
+
+**5. 知道控件名就用 `target`，不要自己混两套坐标。** `desktop_ui_tree` 节点里的
+`x/y/centerX/centerY` 是 UIA 的**屏幕边界**（物理像素），`desktop_click` 的 `x/y`
+是**截图像素**（截图与物理屏不一致时按 `shotWidth` 换算）。两者语义不同；有名字就按名字点。
+
+**6. 等界面用 `desktop_wait`，搬长文本用 `desktop_clipboard`。** 固定 sleep 要么
+不够、要么白等；逐字符注入长文本慢，还可能被目标程序的自定义输入逻辑打断。
 
 ### 命令行直接调引擎
 
@@ -156,13 +215,31 @@ $e = ".\lib\desktop-hand.ps1"
 & $e -Action key -Key ctrl+s                          # 发按键
 & $e -Action focus -Window "MATLAB"                   # 拉到前台
 & $e -Action probe -X 400 -Y 400                      # 检测有无输入源在覆盖光标
+& $e -Action ui-tree -Handle 1234567 -Flat            # 读 UIA 树（纯文本，limit 8000 字符）
+& $e -Action ui-tree -Window "Notepad" -Depth 4 -MaxNodes 400 -AllNodes
+& $e -Action click -Handle 1234567 -Target "Save" -Role button   # 按控件名点
+& $e -Action scroll -X 640 -Y 360 -ShotWidth 1280 -Delta 3       # 纵向向下 3 格
+& $e -Action scroll -X 640 -Y 360 -ShotWidth 1280 -Delta 3 -Horizontal  # 横向
+& $e -Action clipboard -Mode set -Text "C:\path\file.txt" -KeepPrevious
+& $e -Action clipboard -Mode get                     # 读回剪贴板
+& $e -Action wait -Until text -Window "Notepad" -Target "保存" -WaitMs 10000 -PollMs 250
+& $e -Action wait -Until gone -Window "Setup" -WaitMs 30000
+& $e -Action open-app -Target "计算器"                # 启动并等窗口
+& $e -Action open-app -Target "Notepad" -NoWait      # 只启动，不等窗口
 ```
+
+v1.1 新增参数（全部可选）：`-Target`（click 的控件名 / wait 的标题或文本 / open-app 的
+应用名）、`-Role`、`-Depth`（默认 3）、`-MaxNodes`（默认 200）、`-Flat`、`-AllNodes`、
+`-Delta`（默认 3，正=下/右）、`-Horizontal`、`-Mode`（get|set）、`-KeepPrevious`、
+`-WaitMs`（默认 10000）、`-PollMs`（默认 250）、`-NoWait`。
 
 坐标系是**截图里的像素**。`-ShotWidth` 传你所用截图的真实宽度；截图与物理屏 1:1 时
 可省略。`capture` 的结果里会给出 `coordScale` 与 `originX/originY` 供换算。
 
-可用动作（9 个）：`info` `list-windows` `capture` `click` `move` `probe` `type` `key` `focus`。
-拖动是 `click` 的参数（同时给 `-ToX`/`-ToY` 即为拖动），不是独立动作。
+可用动作（14 个）：`info` `list-windows` `capture` `click` `move` `probe` `type` `key`
+`focus` `ui-tree` `scroll` `clipboard` `wait` `open-app`。
+拖动是 `click` 的参数（同时给 `-ToX`/`-ToY` 即为拖动），不是独立动作；
+按控件名点同样是 `click` 的参数（给 `-Target`/`-Role`，此时不必给 `-X`/`-Y`）。
 
 ### 自检
 
@@ -173,10 +250,14 @@ node .\lib\selftest.mjs           # 111 项 — 工具层
 node .\lib\selftest-harness.mjs   # 18 项 — harness 子进程契约
 node .\lib\verify-serialization-contract.mjs   # 25 项 — 宿主序列化契约
 .\lib\occlusion-test.ps1          #  8 项 — 遮挡抓取（需肉眼看图）
+.\lib\selftest-v11.ps1            # v1.1 语义层（ui-tree/click-target/scroll/clipboard/wait/open-app）
+                                  #   需真实交互桌面，未纳入 CI；项数待跑过再记
 .\lib\link-deps.ps1 -Clean
 ```
 
-199 项，本地与 GitHub `windows-latest` 均全绿。依赖真实桌面的检查（窗口枚举、
+**以上项数是 v1.0.x 的记录**（199 项，本地与 GitHub `windows-latest` 均全绿）；
+v1.1 新增用例（ui-tree / scroll / clipboard / wait / open-app / click-target）
+跑过之后再更新，不预填没跑过的数字。依赖真实桌面的检查（窗口枚举、
 键鼠闭环、遮挡抓取）在环境不满足时**跳过而非失败**——环境无法构造场景不等于代码
 有缺陷。`fail` 是唯一代表代码坏了的信号。
 
@@ -197,8 +278,9 @@ CI 覆盖不到"插件能否在运行中的 DSH 里加载"，那需要装 DSH �
 
 ```
 ┌─ DSH agent ────────────────────────────────────────────┐
-│  desktop_diagnose / list_windows / capture / focus /   │
-│  click / type          ← 6 个 defineTool               │
+│  11 tools: diagnose / list_windows / capture / focus,  │
+│  click / ui_tree / scroll / clipboard / wait,          │
+│  open_app / type        ← 11 个 defineTool             │
 └───────────────────────┬────────────────────────────────┘
                         │  ctx.subprocess.spawn
                         │  argv + JSON on stdout
@@ -210,8 +292,10 @@ CI 覆盖不到"插件能否在运行中的 DSH 里加载"，那需要装 DSH �
 
 ### `lib/index.js` — 工具层（Node, ESM）
 
-- 用 `defineTool` 注册 6 个工具。参数是 dsh-tools 的**扁平 JSON-Schema 属性表**
+- 用 `defineTool` 注册 11 个工具。参数是 dsh-tools 的**扁平 JSON-Schema 属性表**
   （不是 schemastery，后者只用于插件自己的 `Config`）。
+- v1.1 新增的 5 个工具各自包 `try/catch` 注册：插件在 profile 里是 `required: true`，
+  单个工具注册失败只能 warning，不能拖垮 DSH 启动。
 - 经 `ctx.subprocess.spawn` 起引擎。**不用裸 `node:child_process`**：DSH 沙箱会
   拒绝 Node 以管道 stdio 起子进程（裸 `spawn` 报 `EPERM`）。裸 `spawn` 仅作脱离
   DSH 时的退路。
@@ -256,17 +340,19 @@ dsh-desktop-hand/
 ├── docs/
 │   ├── COMPATIBILITY.md          DSH 版本兼容、启动失败事故、三个序列化陷阱
 │   ├── INCIDENT-2026-10-03-...  图片块序列化故障的原始排查报告（中文）
-│   ├── evidence/                故障报告引用的实拍图
+│   ├── DESIGN-v1.1-ui-layer.zh-CN.md  v1.1 接口规格（已冻结，改接口先改它）
+│   ├── evidence/                故障报告与空白壳对照的实拍图
 │   └── ENGINEERING-NOTES.zh-CN.md  详细工程笔记（中文，含每个 bug 的定位过程）
 ├── skills/desktop-hand/          给 agent 的用法 skill
 └── lib/
-    ├── index.js                  6 个 defineTool + 图片返回
+    ├── index.js                  11 个 defineTool + 图片返回
     ├── desktop-hand.ps1          PowerShell 引擎
     ├── selftest.ps1              引擎自检
     ├── selftest.mjs              工具层自检
     ├── selftest-harness.mjs      子进程 seam 契约自检
     ├── verify-serialization-contract.mjs  宿主序列化契约守卫
     ├── occlusion-test.ps1        遮挡抓取验证
+    ├── selftest-v11.ps1          v1.1 语义层自检（需真实交互桌面）
     ├── hold-windows.ps1          测试台：造一对"目标 + 完全遮挡"窗口
     └── link-deps.ps1             为脱离 DSH 的自检建/清依赖链接
 ```

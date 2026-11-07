@@ -1,7 +1,7 @@
 {
   "name": "dsh-desktop-hand",
-  "version": "1.0.4",
-  "description": "Hands and eyes for a DSH agent on Windows: capture any window's own content even while occluded (PrintWindow), click by coordinate, type Unicode text that bypasses the IME, and focus windows — all as agent tools that work from any workspace.",
+  "version": "1.1.0",
+  "description": "Hands and eyes for a DSH agent on Windows: capture any window's own content even while occluded (PrintWindow), read a window as a UI Automation tree (works even when the shell renders blank), click by coordinate or by control name, scroll, read/write the clipboard, wait for windows and controls, launch apps from Start Menu shortcuts, and type Unicode text that bypasses the IME — all as agent tools that work from any workspace.",
   "type": "module",
   "main": "lib/index.js",
   "files": [
