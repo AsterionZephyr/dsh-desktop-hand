@@ -257,11 +257,16 @@ node .\lib\verify-serialization-contract.mjs   # 25 项 — 宿主序列化契�
 
 **以上项数是 v1.1.0 的记录**（37+146+18+25+8 = 234 项；引擎 37 与工具层 146 取自
 GitHub `windows-latest` 实测，harness 18、序列化契约 25、遮挡 8 沿用 v1.0.x 记录）。
-工具层与 harness 这两套 node 套件在本机跑不全
-（DSH 沙箱不允许 node 起子进程，`spawn EPERM`），由 GitHub `windows-latest` 验证；引擎、
-遮挡、语义层三套 PowerShell 套件本机可直接跑。v1.1 语义层的项数等真机跑过再补。依赖真实桌面的检查（窗口枚举、
-键鼠闭环、遮挡抓取）在环境不满足时**跳过而非失败**——环境无法构造场景不等于代码
-有缺陷。`fail` 是唯一代表代码坏了的信号。
+v1.1 语义层（`selftest-v11.ps1`）的项数等真机跑过再补。
+
+> **要在普通终端里跑，别在 DSH 代理会话的沙箱里跑。** PS 5.1 的 `Add-Type` 靠 `csc.exe`
+> 编译，受限沙箱下报 `A required privilege is not held by the client`，引擎于是「无输出」、
+> 各套件全红（2026-11-08 实测）；同一限制下 node 套件会 `spawn EPERM`。这不是代码缺陷。
+> 另：每份 `.ps1` 都必须是 **UTF-8 带 BOM**——5.1 会把无 BOM 的 UTF-8 当 ANSI 读，
+> 中文变乱码甚至解析失败（`occlusion-test.ps1` 就踩过，已补 BOM）。
+
+依赖真实桌面的检查（窗口枚举、键鼠闭环、遮挡抓取）在环境不满足时**跳过而非失败**——
+环境无法构造场景不等于代码有缺陷。`fail` 是唯一代表代码坏了的信号。
 
 `verify-serialization-contract.mjs` 与其它四套不同：它读的是**宿主的源码**，
 用来钉住我们依赖的上游行为（`snapshotJsonValue` 接受/拒绝哪些值、
