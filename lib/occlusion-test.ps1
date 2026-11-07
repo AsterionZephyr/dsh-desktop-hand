@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     专门验证「被遮挡的窗口也能抓到自己的内容」—— 本插件相对市场插件的核心差异。
 
@@ -23,7 +23,9 @@ param([string]$Engine)
 
 $ErrorActionPreference = 'Stop'
 if (-not $Engine) { $Engine = Join-Path $PSScriptRoot 'desktop-hand.ps1' }
-$outDir = Join-Path $env:TEMP 'dsh-desktop-hand-occlusion'
+$outDir = if ($env:DSH_OCCLUSION_OUT_DIR) { $env:DSH_OCCLUSION_OUT_DIR }
+  elseif ($env:RUNNER_TEMP) { Join-Path $env:RUNNER_TEMP 'dsh-desktop-hand-occlusion' }
+  else { Join-Path $env:TEMP 'dsh-desktop-hand-occlusion' }
 if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Force -Path $outDir | Out-Null }
 
 $script:pass = 0; $script:fail = 0

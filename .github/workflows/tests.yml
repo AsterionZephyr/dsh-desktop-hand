@@ -1,10 +1,10 @@
 name: tests
 
 # Runs all four of the plugin's self-test suites on a real Windows runner:
-#   lib/selftest.ps1          32 checks — the PowerShell engine against real Win32 APIs
-#   lib/selftest.mjs         120 checks — the tool layer (apply/register/schema/execute)
+#   lib/selftest.ps1          37 checks — the PowerShell engine against real Win32 APIs
+#   lib/selftest.mjs         146 checks — the tool layer (apply/register/schema/execute)
 #   lib/selftest-harness.mjs  18 checks — the DSH subprocess seam contract, via a fake seam
-#   lib/occlusion-test.ps1     7 checks — occluded-window capture (PrintWindow vs CopyFromScreen)
+#   lib/occlusion-test.ps1     8 checks — occluded-window capture (PrintWindow vs CopyFromScreen)
 #
 # Dependency note: the plugin's peer dependencies normally ship inside DSH, which is
 # not present on CI. They ARE published to npm, so CI installs them there. Only
@@ -14,7 +14,7 @@ name: tests
 # Scope note: this cannot prove the plugin loads inside a *running* DSH process;
 # that needs a DSH install and a restart, and stays a manual step
 # (see docs/COMPATIBILITY.md §5). What it does prove is that apply() registers all
-# tool with a valid schema — the part of loading checkable without booting DSH.
+# tools with valid schemas — the part of loading checkable without booting DSH.
 
 on:
   push:
