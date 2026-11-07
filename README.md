@@ -246,7 +246,7 @@ v1.1 新增参数（全部可选）：`-Target`（click 的控件名 / wait 的�
 ```powershell
 .\lib\link-deps.ps1               # 为脱离 DSH 的自检链接 peer 依赖
 .\lib\selftest.ps1                # 37 项 — 引擎
-node .\lib\selftest.mjs           # 111 项 — 工具层
+node .\lib\selftest.mjs           # 120 项 — 工具层（11 个工具）
 node .\lib\selftest-harness.mjs   # 18 项 — harness 子进程契约
 node .\lib\verify-serialization-contract.mjs   # 25 项 — 宿主序列化契约
 .\lib\occlusion-test.ps1          #  8 项 — 遮挡抓取（需肉眼看图）
@@ -255,9 +255,9 @@ node .\lib\verify-serialization-contract.mjs   # 25 项 — 宿主序列化契�
 .\lib\link-deps.ps1 -Clean
 ```
 
-**以上项数是 v1.0.x 的记录**（199 项，本地与 GitHub `windows-latest` 均全绿）；
-v1.1 新增用例（ui-tree / scroll / clipboard / wait / open-app / click-target）
-跑过之后再更新，不预填没跑过的数字。依赖真实桌面的检查（窗口枚举、
+**以上项数是 v1.1.0 的记录**（208 项）。工具层与 harness 这两套 node 套件在本机跑不全
+（DSH 沙箱不允许 node 起子进程，`spawn EPERM`），由 GitHub `windows-latest` 验证；引擎、
+遮挡、语义层三套 PowerShell 套件本机可直接跑。v1.1 语义层的项数等真机跑过再补。依赖真实桌面的检查（窗口枚举、
 键鼠闭环、遮挡抓取）在环境不满足时**跳过而非失败**——环境无法构造场景不等于代码
 有缺陷。`fail` 是唯一代表代码坏了的信号。
 

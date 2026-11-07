@@ -2,7 +2,7 @@ name: tests
 
 # Runs all four of the plugin's self-test suites on a real Windows runner:
 #   lib/selftest.ps1          32 checks — the PowerShell engine against real Win32 APIs
-#   lib/selftest.mjs          79 checks — the tool layer (apply/register/schema/execute)
+#   lib/selftest.mjs         120 checks — the tool layer (apply/register/schema/execute)
 #   lib/selftest-harness.mjs  18 checks — the DSH subprocess seam contract, via a fake seam
 #   lib/occlusion-test.ps1     7 checks — occluded-window capture (PrintWindow vs CopyFromScreen)
 #
@@ -14,7 +14,7 @@ name: tests
 # Scope note: this cannot prove the plugin loads inside a *running* DSH process;
 # that needs a DSH install and a restart, and stays a manual step
 # (see docs/COMPATIBILITY.md §5). What it does prove is that apply() registers all
-# six tools with valid schemas — the part of loading checkable without booting DSH.
+# tool with a valid schema — the part of loading checkable without booting DSH.
 
 on:
   push:
@@ -142,8 +142,22 @@ jobs:
         # stderr becomes a terminating error that aborts the step. Exit codes are
         # checked explicitly instead.
         run: |
-          node ./lib/selftest.mjs
-          if ($LASTEXITCODE -ne 0) { Write-Host "::error::tool-layer self-test exited $LASTEXITCODE"; exit $LASTEXITCODE }
+          # The Actions *log* endpoint needs authentication, so on failure every
+          # FAIL line is also emitted as an annotation — those are readable
+          # anonymously through the check-runs API.
+          $out = Join-Path $env:RUNNER_TEMP 'tool-layer-output.txt'
+          node ./lib/selftest.mjs *> $out
+          $code = $LASTEXITCODE
+          Get-Content $out | Write-Host
+          $verdict = (Get-Content $out | Select-String '结果：' | Select-Object -Last 1).Line
+          Write-Host "::notice::LASTEXITCODE=$code ; $verdict"
+          if ($code -ne 0) {
+            foreach ($l in (Get-Content $out | Select-String 'FAIL')) {
+              Write-Host "::error::$($l.Line.Trim())"
+            }
+            Write-Host "::error::tool-layer self-test exited $code"
+            exit $code
+          }
 
       - name: Subprocess-seam contract self-test
         shell: pwsh
